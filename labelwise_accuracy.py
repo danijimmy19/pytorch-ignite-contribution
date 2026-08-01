@@ -1,16 +1,14 @@
+"""Reusable implementation of label-wise multilabel accuracy.
+
+This module exposes :class:`LabelwiseAccuracy`, a small extension of Ignite's
+``Accuracy`` metric for multilabel problems. When ``average="label-wise"`` is
+selected, the metric returns one accuracy value per label as a tensor with shape
+``(C,)``. When ``average="macro"`` is selected, it returns the mean of those
+per-label accuracies as a scalar. In the default subset-accuracy mode, it
+preserves the standard scalar behavior of Ignite's ``Accuracy``.
 """
-Label-wise accuracy for multi-label classification.
 
-Addresses pytorch/ignite issue #513:
-  https://github.com/pytorch/ignite/issues/513
-
-Ignite's Accuracy for multilabel inputs computes subset (exact-match) accuracy:
-every label must match for a sample to be counted correct. This class adds
-average='label-wise', which returns a per-label accuracy tensor of shape (C,),
-consistent with how Precision(average=False) and Recall(average=False) behave.
-
-Intended as a drop-in addition to ignite/metrics/accuracy.py.
-"""
+from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
@@ -20,38 +18,20 @@ from ignite.exceptions import NotComputableError
 from ignite.metrics import Accuracy
 from ignite.metrics.metric import reinit__is_reduced, sync_all_reduce
 
+__all__ = ["LabelwiseAccuracy"]
+
 
 class LabelwiseAccuracy(Accuracy):
-    """Accuracy metric extended with per-label support for multilabel problems.
-
-    When ``average='label-wise'`` and ``is_multilabel=True``, ``compute()``
-    returns a ``torch.Tensor`` of shape ``(C,)`` where entry ``i`` is the
-    fraction of samples for which label ``i`` was predicted correctly.
-
-    All other configurations fall back to the standard ``Accuracy`` behavior
-    (subset accuracy, returning a float scalar).
+    """Accuracy metric with optional label-wise output for multilabel data.
 
     Args:
-        output_transform: callable to transform engine output into ``(y_pred, y)``.
-        is_multilabel: must be ``True`` when ``average='label-wise'``.
-        device: device for accumulation tensors.
-        skip_unrolling: whether to unroll multi-output predictions.
-        average: ``None`` for standard subset accuracy, or ``'label-wise'``
-            to return per-label accuracy. Only valid when ``is_multilabel=True``.
-
-    Example::
-
-        import torch
-        from labelwise_accuracy import LabelwiseAccuracy
-
-        y_pred = torch.tensor([[1, 0, 1], [0, 1, 0], [1, 1, 0]])
-        y_true = torch.tensor([[1, 0, 0], [0, 1, 0], [1, 0, 0]])
-
-        acc = LabelwiseAccuracy(is_multilabel=True, average="label-wise")
-        acc.reset()
-        acc.update((y_pred, y_true))
-        print(acc.compute())
-        # tensor([1.0000, 0.6667, 0.3333], dtype=torch.float64)
+        output_transform: Callable used to transform engine output into ``(y_pred, y)``.
+        is_multilabel: Must be ``True`` whenever ``average="label-wise"`` is requested.
+        device: Target device for accumulation tensors.
+        skip_unrolling: Whether to unroll multi-output predictions.
+        average: ``None`` for standard subset accuracy, ``"label-wise"`` for
+            per-label accuracy, or ``"macro"`` for the mean of the per-label
+            accuracies.
     """
 
     def __init__(
@@ -61,18 +41,41 @@ class LabelwiseAccuracy(Accuracy):
         device: str | torch.device = torch.device("cpu"),
         skip_unrolling: bool = False,
         average: str | None = None,
-    ):
-        if average is not None and average != "label-wise":
-            raise ValueError(f"average must be None or 'label-wise', got '{average}'.")
-        if average == "label-wise" and not is_multilabel:
-            raise ValueError("average='label-wise' is only supported when is_multilabel=True.")
-        self._average = average
+    ) -> None:
+        if average not in {None, "label-wise", "macro"}:
+            raise ValueError(f"average must be None, 'label-wise', or 'macro', got '{average}'.")
+        if average in {"label-wise", "macro"} and not is_multilabel:
+            raise ValueError("average='label-wise' and average='macro' are only supported when is_multilabel=True.")
+
         super().__init__(
             output_transform=output_transform,
             is_multilabel=is_multilabel,
             device=device,
             skip_unrolling=skip_unrolling,
         )
+        self._average = average
+
+    @reinit__is_reduced
+    def reset(self) -> None:
+        self._num_correct = torch.tensor(0, device=self._device, dtype=torch.float64)
+        self._num_examples = 0
+        super().reset()
+
+    def _reshape_multilabel_inputs(self, y_pred: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        num_classes = y_pred.size(1)
+        last_dim = y_pred.ndimension()
+
+        if last_dim <= 1:
+            return y_pred.reshape(-1, num_classes), y.reshape(-1, num_classes)
+
+        y_pred = torch.transpose(y_pred, 1, last_dim - 1).reshape(-1, num_classes)
+        y = torch.transpose(y, 1, last_dim - 1).reshape(-1, num_classes)
+        return y_pred, y
+
+    def _prepare_vector_accumulator(self, num_labels: int) -> None:
+        self._num_correct = self._num_correct.to(self._device)
+        if self._num_correct.numel() == 1:
+            self._num_correct = torch.zeros(num_labels, device=self._device, dtype=torch.float64)
 
     @reinit__is_reduced
     def update(self, output: Sequence[torch.Tensor]) -> None:
@@ -80,33 +83,21 @@ class LabelwiseAccuracy(Accuracy):
         self._check_type(output)
         y_pred, y = output[0].detach(), output[1].detach()
 
-        if self._type == "multilabel" and self._average == "label-wise":
-            # Reshape (N, C, ...) -> (N * ..., C) to handle spatial inputs
-            num_classes = y_pred.size(1)
-            last_dim = y_pred.ndimension()
-            y_pred = torch.transpose(y_pred, 1, last_dim - 1).reshape(-1, num_classes)
-            y = torch.transpose(y, 1, last_dim - 1).reshape(-1, num_classes)
-
-            # Per-label correct counts: (N, C) summed over samples -> (C,)
-            # Root cause fix for issue #513: remove torch.all(..., dim=-1) collapse
-            correct_per_label = (y == y_pred.type_as(y)).to(dtype=torch.float64)
-            # Non-in-place: on the first call _num_correct is scalar 0; broadcasting
-            # scalar(0) + tensor(C,) works with = but fails with += (in-place reshape).
-            self._num_correct = self._num_correct + correct_per_label.sum(dim=0).to(self._device)
-            self._num_examples += y.shape[0]
+        if self._average in {"label-wise", "macro"} and self._type == "multilabel":
+            y_pred, y = self._reshape_multilabel_inputs(y_pred, y)
+            correct = (y == y_pred.type_as(y)).to(dtype=torch.float64, device=self._device)
+            self._prepare_vector_accumulator(correct.size(1))
+            self._num_correct += correct.sum(dim=0).to(self._device)
+            self._num_examples += correct.size(0)
             return
 
-        # --- All other cases: standard Accuracy logic (subset / binary / multiclass) ---
         if self._type == "binary":
             correct = torch.eq(y_pred.view(-1).to(y), y.view(-1))
         elif self._type == "multiclass":
             indices = torch.argmax(y_pred, dim=1)
             correct = torch.eq(indices, y).view(-1)
         elif self._type == "multilabel":
-            num_classes = y_pred.size(1)
-            last_dim = y_pred.ndimension()
-            y_pred = torch.transpose(y_pred, 1, last_dim - 1).reshape(-1, num_classes)
-            y = torch.transpose(y, 1, last_dim - 1).reshape(-1, num_classes)
+            y_pred, y = self._reshape_multilabel_inputs(y_pred, y)
             correct = torch.all(y == y_pred.type_as(y), dim=-1)
         else:
             raise ValueError(f"Unexpected type: {self._type}")
@@ -118,6 +109,11 @@ class LabelwiseAccuracy(Accuracy):
     def compute(self) -> float | torch.Tensor:
         if self._num_examples == 0:
             raise NotComputableError("Accuracy must have at least one example before it can be computed.")
-        if self._average == "label-wise":
-            return self._num_correct / self._num_examples
+
+        if self._average in {"label-wise", "macro"}:
+            per_label_accuracy = self._num_correct / self._num_examples
+            if self._average == "macro":
+                return per_label_accuracy.mean().item()
+            return per_label_accuracy
+
         return self._num_correct.item() / self._num_examples
