@@ -71,12 +71,27 @@ The specific fix is at `accuracy.py:304–315`: replace `torch.all(..., dim=-1)`
 | Phase | Task |
 |-------|------|
 | **Exploration** | Fork the repo, study `ignite/metrics/accuracy.py`, `precision.py`, `recall.py` and existing tests ✓ |
-| **Implementation** | Add `average="label-wise"` to `Accuracy` for `is_multilabel=True` |
-| **Testing** | Write unit tests consistent with existing test patterns (compared against scikit-learn per-column) |
+| **Implementation** | Add `average="label-wise"` to `Accuracy` for `is_multilabel=True` ✓ |
+| **Testing** | Write unit tests consistent with existing test patterns (compared against scikit-learn per-column) ✓ |
 | **Documentation** | Update docstrings with RST-formatted examples |
-| **PR** | Submit a pull request referencing issue #513 |
+| **PR** | Submit a pull request referencing issue #513 ✓ |
 
 ---
+
+## Pull Request
+
+- **PR:** [pytorch/ignite#3820](https://github.com/pytorch/ignite/pull/3820)
+- **Summary:** Adds `average="label-wise"` support to `Accuracy` for multilabel classification, returning a `(C,)` per-label accuracy tensor instead of collapsing to a single subset-accuracy scalar. Includes tests validated against `sklearn.metrics.accuracy_score` computed per column.
+- **Status:** Awaiting review
+
+---
+
+## Learnings & Reflections
+
+- **Root-causing over patching:** The real fix wasn't adding a new metric — it was recognizing that `Accuracy`'s `_num_correct` was a scalar with no `average` dispatch, while `Precision`/`Recall` already had that machinery (`_BasePrecisionRecall`) from the same 2019 commit. Framing it as a parity gap made the implementation obvious.
+- **PyTorch in-place ops and shape promotion:** `self._num_correct += tensor` fails on the first call because `_num_correct` starts as a scalar (`shape=[]`) and in-place addition can't broadcast it up to `(C,)`. Switching to non-in-place reassignment (`self._num_correct = self._num_correct + tensor`) fixed it without needing to override `reset()`.
+- **Verifying against a second implementation:** Cross-checking every result against `sklearn.metrics.accuracy_score` computed per label column (rather than trusting the new code in isolation) caught subtle indexing mistakes early and made the tests much more convincing in the PR description.
+- **Open source has social overhead, not just code:** Getting a PR "submit-ready" turned out to require more than working code and tests — surfacing it to a maintainer and checking for overlapping open PRs on the same issue (e.g. #3810) is part of the actual contribution workflow, not an afterthought.
 
 ## Resources
 
